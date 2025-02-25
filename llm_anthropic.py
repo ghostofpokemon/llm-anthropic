@@ -4,7 +4,7 @@ import json
 from pydantic import Field, field_validator, model_validator
 from typing import Optional, List, Union
 
-DEFAULT_THINKING_TOKENS = 1024
+DEFAULT_THINKING_TOKENS = 16000
 DEFAULT_TEMPERATURE = 1.0
 
 
@@ -66,24 +66,24 @@ def register_models(register):
         ClaudeMessagesThinking(
             "claude-3-7-sonnet-20250219",
             supports_pdf=True,
-            default_max_tokens=8192,
+            default_max_tokens=20000,
         ),
         AsyncClaudeMessagesThinking(
             "claude-3-7-sonnet-20250219",
             supports_pdf=True,
-            default_max_tokens=8192,
+            default_max_tokens=20000,
         ),
     )
     register(
         ClaudeMessagesThinking(
             "claude-3-7-sonnet-latest",
             supports_pdf=True,
-            default_max_tokens=8192,
+            default_max_tokens=20000,
         ),
         AsyncClaudeMessagesThinking(
             "claude-3-7-sonnet-latest",
             supports_pdf=True,
-            default_max_tokens=8192,
+            default_max_tokens=20000,
         ),
         aliases=("claude-3.7-sonnet", "claude-3.7-sonnet-latest"),
     )
@@ -308,11 +308,35 @@ class _Shared:
         if prompt.options.stop_sequences:
             kwargs["stop_sequences"] = prompt.options.stop_sequences
 
-        if self.supports_thinking and (
-            prompt.options.thinking or prompt.options.thinking_budget
-        ):
-            prompt.options.thinking = True
-            budget_tokens = prompt.options.thinking_budget or DEFAULT_THINKING_TOKENS
+        if self.supports_thinking and prompt.options.thinking is not None:
+            # Default values
+            budget_tokens = DEFAULT_THINKING_TOKENS
+            display_thinking = True
+            
+            # Parse the thinking option
+            thinking_option = prompt.options.thinking
+            
+            # Check if we have a hide directive
+            if ":" in thinking_option:
+                base_option, display_option = thinking_option.split(":", 1)
+                if display_option.lower() == "hide":
+                    display_thinking = False
+                # Reset thinking_option to just the base part for budget parsing
+                thinking_option = base_option
+            
+            # See if there's a budget specified after the thinking option
+            thinking_parts = thinking_option.strip().split()
+            if len(thinking_parts) > 1:
+                try:
+                    budget_tokens = int(thinking_parts[1])
+                except (ValueError, IndexError):
+                    # If we can't parse it, use default
+                    pass
+            
+            # Store display preference on the object for execute methods to use
+            self.display_thinking = display_thinking
+            
+            # Set the actual API parameter
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens}
 
         max_tokens = self.default_max_tokens
@@ -353,31 +377,80 @@ class ClaudeMessages(_Shared, llm.KeyModel):
             messages_client = client.beta.messages
         else:
             messages_client = client.messages
+        
+        # Get the display preference from the object
+        display_thinking = getattr(self, 'display_thinking', False)
+        
         if stream:
             with messages_client.stream(**kwargs) as stream:
                 if prefill_text:
                     yield prefill_text
-                for text in stream.text_stream:
-                    yield text
+                    
+                # Initialize tracking variables
+                thinking_content = []
+                in_thinking_block = False
+                
+                for chunk in stream:
+                    # Look for content blocks
+                    if hasattr(chunk, "delta") and hasattr(chunk.delta, "thinking"):
+                        # We're in a thinking block
+                        if chunk.delta.thinking:
+                            thinking_content.append(chunk.delta.thinking)
+                            if display_thinking:
+                                in_thinking_block = True
+                                yield f"{chunk.delta.thinking}"
+                    elif hasattr(chunk, "delta") and hasattr(chunk.delta, "text") and in_thinking_block:
+                        # We've transitioned from thinking to text - yield a separator
+                        yield "\n\n=== END OF THINKING | FINAL RESPONSE ===\n\n"
+                        in_thinking_block = False
+                        yield chunk.delta.text
+                    elif hasattr(chunk, "delta") and hasattr(chunk.delta, "text"):
+                        # Normal text chunk
+                        yield chunk.delta.text
+                
+                # Store thinking in response object if collected
+                if thinking_content:
+                    response.thinking = "".join(thinking_content)
+                    
                 # This records usage and other data:
                 response.response_json = stream.get_final_message().model_dump()
         else:
             completion = messages_client.create(**kwargs)
-            text = "".join(
-                [item.text for item in completion.content if hasattr(item, "text")]
-            )
+            
+            # Extract thinking content if present
+            thinking_content = None
+            for item in completion.content:
+                if hasattr(item, "type") and item.type == "thinking" and hasattr(item, "thinking"):
+                    thinking_content = item.thinking
+                    # Store thinking in response object
+                    response.thinking = thinking_content
+                    break
+            
+            # Display thinking if enabled and content exists
+            if display_thinking and thinking_content:
+                yield "=== CLAUDE'S THINKING PROCESS ===\n\n"
+                yield thinking_content
+                yield "\n\n=== FINAL RESPONSE ===\n\n"
+            
+            # Extract and yield normal text content
+            text = "".join([item.text for item in completion.content if hasattr(item, "text")])
             yield prefill_text + text
+            
             response.response_json = completion.model_dump()
+        
         self.set_usage(response)
 
 
 class ClaudeOptionsWithThinking(ClaudeOptions):
-    thinking: Optional[bool] = Field(
-        description="Enable thinking mode",
+    thinking: Optional[str] = Field(
+        description="Enable thinking mode with optional token budget. Format: 'thinking[:hide] [budget]'. "
+                   "Default budget is 16000. Use 'thinking:hide' to enable thinking but hide the output.",
         default=None,
     )
+    # Keep thinking_budget for backward compatibility
     thinking_budget: Optional[int] = Field(
-        description="Number of tokens to budget for thinking", default=None
+        description="Number of tokens to budget for thinking", 
+        default=None
     )
 
 
@@ -391,26 +464,73 @@ class AsyncClaudeMessages(_Shared, llm.AsyncKeyModel):
     async def execute(self, prompt, stream, response, conversation, key):
         client = AsyncAnthropic(api_key=self.get_key(key))
         kwargs = self.build_kwargs(prompt, conversation)
+        prefill_text = self.prefill_text(prompt)
         if "betas" in kwargs:
             messages_client = client.beta.messages
         else:
             messages_client = client.messages
-        prefill_text = self.prefill_text(prompt)
+        
+        # Get the display preference from the object
+        display_thinking = getattr(self, 'display_thinking', False)
+        
         if stream:
             async with messages_client.stream(**kwargs) as stream_obj:
                 if prefill_text:
                     yield prefill_text
-                async for text in stream_obj.text_stream:
-                    yield text
-            response.response_json = (await stream_obj.get_final_message()).model_dump()
+                    
+                # Initialize tracking variables
+                thinking_content = []
+                in_thinking_block = False
+                
+                async for chunk in stream_obj:
+                    # Look for content blocks
+                    if hasattr(chunk, "delta") and hasattr(chunk.delta, "thinking"):
+                        # We're in a thinking block
+                        if chunk.delta.thinking:
+                            thinking_content.append(chunk.delta.thinking)
+                            if display_thinking:
+                                in_thinking_block = True
+                                yield f"{chunk.delta.thinking}"
+                    elif hasattr(chunk, "delta") and hasattr(chunk.delta, "text") and in_thinking_block:
+                        # We've transitioned from thinking to text - yield a separator
+                        yield "\n\n=== END OF THINKING | FINAL RESPONSE ===\n\n"
+                        in_thinking_block = False
+                        yield chunk.delta.text
+                    elif hasattr(chunk, "delta") and hasattr(chunk.delta, "text"):
+                        # Normal text chunk
+                        yield chunk.delta.text
+                
+                # Store thinking in response object if collected
+                if thinking_content:
+                    response.thinking = "".join(thinking_content)
+                    
+                # This records usage and other data:
+                response.response_json = (await stream_obj.get_final_message()).model_dump()
         else:
             completion = await messages_client.create(**kwargs)
-            text = "".join(
-                [item.text for item in completion.content if hasattr(item, "text")]
-            )
+            
+            # Extract thinking content if present
+            thinking_content = None
+            for item in completion.content:
+                if hasattr(item, "type") and item.type == "thinking" and hasattr(item, "thinking"):
+                    thinking_content = item.thinking
+                    # Store thinking in response object
+                    response.thinking = thinking_content
+                    break
+            
+            # Display thinking if enabled and content exists
+            if display_thinking and thinking_content:
+                yield "=== CLAUDE'S THINKING PROCESS ===\n\n"
+                yield thinking_content
+                yield "\n\n=== FINAL RESPONSE ===\n\n"
+            
+            # Extract and yield normal text content
+            text = "".join([item.text for item in completion.content if hasattr(item, "text")])
             yield prefill_text + text
+            
             response.response_json = completion.model_dump()
-        self.set_usage(response)
+        
+        await self.set_usage(response)
 
 
 class AsyncClaudeMessagesThinking(AsyncClaudeMessages):
