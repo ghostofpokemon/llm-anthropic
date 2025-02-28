@@ -196,6 +196,22 @@ response = llm.query(
 )
 ```
 
+## Thinking Mode
+
+Claude 3.7 offers enhanced reasoning capabilities through its "thinking" mode:
+
+- Basic usage (shows thinking, 16K tokens):  
+  `llm "What are the prime factors of 13290059?" -m claude-3.7 -o thinking`
+
+- Custom thinking budget:  
+  `llm "Solve this equation: 3x²+8x-7=0" -m claude-3.7 -o thinking 32000`
+
+- Enable thinking but hide the output:  
+  `llm "What's a creative solution to urban congestion?" -m claude-3.7 -o thinking hide`
+
+- Hidden thinking with custom budget:  
+  `llm "Design a system for..." -m claude-3.7 -o thinking "hide 48000"`
+
 ## Development
 
 To set up this plugin locally, first checkout the code. Then create a new virtual environment:

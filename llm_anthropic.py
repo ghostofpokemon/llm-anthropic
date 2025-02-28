@@ -282,6 +282,18 @@ class _Shared:
             messages.append({"role": "assistant", "content": prompt.options.prefill})
         return messages
 
+    @field_validator("thinking")
+    def validate_thinking(cls, v):
+        if v is None:
+            return v
+            
+        # Convert to string if it's a number
+        if isinstance(v, (int, float)):
+            return f"thinking {v}"
+            
+        # Return as is - we'll handle parsing in build_kwargs
+        return v
+
     def build_kwargs(self, prompt, conversation):
         kwargs = {
             "model": self.claude_model_id,
@@ -314,30 +326,32 @@ class _Shared:
             display_thinking = True
             
             # Parse the thinking option
-            thinking_option = prompt.options.thinking
+            thinking_option = str(prompt.options.thinking)
             
             # Check if we have a hide directive
-            if ":" in thinking_option:
-                base_option, display_option = thinking_option.split(":", 1)
-                if display_option.lower() == "hide":
-                    display_thinking = False
-                # Reset thinking_option to just the base part for budget parsing
-                thinking_option = base_option
-            
-            # See if there's a budget specified after the thinking option
-            thinking_parts = thinking_option.strip().split()
-            if len(thinking_parts) > 1:
+            if thinking_option.startswith("thinking:hide"):
+                display_thinking = False
+                # Extract budget if present
+                parts = thinking_option.split()
+                if len(parts) > 1:
+                    try:
+                        budget_tokens = int(parts[1])
+                    except (ValueError, IndexError):
+                        pass
+            elif thinking_option.startswith("thinking") and len(thinking_option.split()) > 1:
+                # Extract budget if present
                 try:
-                    budget_tokens = int(thinking_parts[1])
+                    budget_tokens = int(thinking_option.split()[1])
                 except (ValueError, IndexError):
-                    # If we can't parse it, use default
                     pass
             
             # Store display preference on the object for execute methods to use
             self.display_thinking = display_thinking
             
-            # Set the actual API parameter
-            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens}
+            # Always put thinking in extra_body
+            kwargs["extra_body"] = {
+                "thinking": {"type": "enabled", "budget_tokens": budget_tokens}
+            }
 
         max_tokens = self.default_max_tokens
         if prompt.options.max_tokens is not None:
@@ -351,8 +365,6 @@ class _Shared:
         kwargs["max_tokens"] = max_tokens
         if max_tokens > 64000:
             kwargs["betas"] = ["output-128k-2025-02-19"]
-            if "thinking" in kwargs:
-                kwargs["extra_body"] = {"thinking": kwargs.pop("thinking")}
 
         return kwargs
 
@@ -442,9 +454,8 @@ class ClaudeMessages(_Shared, llm.KeyModel):
 
 
 class ClaudeOptionsWithThinking(ClaudeOptions):
-    thinking: Optional[str] = Field(
-        description="Enable thinking mode with optional token budget. Format: 'thinking[:hide] [budget]'. "
-                   "Default budget is 16000. Use 'thinking:hide' to enable thinking but hide the output.",
+    thinking: Optional[Union[bool, int, str]] = Field(
+        description="Enable thinking mode with optional token budget or 'hide' to hide output. Examples: true, 16000, hide, 'hide 16000'",
         default=None,
     )
     # Keep thinking_budget for backward compatibility
@@ -452,6 +463,50 @@ class ClaudeOptionsWithThinking(ClaudeOptions):
         description="Number of tokens to budget for thinking", 
         default=None
     )
+
+    @field_validator("thinking")
+    def validate_thinking(cls, v):
+        if v is None:
+            return v
+            
+        # If it's a boolean True, just enable thinking with default settings
+        if v is True:
+            return "thinking"
+            
+        # If it's just a number, treat it as a budget
+        try:
+            budget = int(v)
+            return f"thinking {budget}"
+        except (ValueError, TypeError):
+            pass
+            
+        # Handle string values
+        if isinstance(v, str):
+            v = v.strip().lower()
+            
+            # Handle "hide" by itself
+            if v == "hide":
+                return "thinking:hide"
+                
+            # Handle "hide N" format
+            if v.startswith("hide "):
+                parts = v.split()
+                if len(parts) > 1:
+                    try:
+                        budget = int(parts[1])
+                        return f"thinking:hide {budget}"
+                    except ValueError:
+                        pass
+                return "thinking:hide"
+                
+            # Handle "true" value
+            if v == "true":
+                return "thinking"
+                
+            # Just return as is for further processing
+            return v
+                
+        return v
 
 
 class ClaudeMessagesThinking(ClaudeMessages):
