@@ -24,7 +24,5 @@ jobs:
         pip install -e '.[test]'
     - name: Run tests
       run: |
-        pytest
-    - name: Check if cog needs to be run
-      run: |
-        cog --check README.md
+        python -m pytest
+        python -m cogapp --check README.md
